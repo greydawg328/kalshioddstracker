@@ -1,15 +1,19 @@
 """
-Odds tracker.
-Each run does two things:
-  1. SNAPSHOT: for regular-season games starting in the next 45-120 minutes that
-     haven't been logged yet, record Kalshi's prices for both teams.
-  2. RESULTS: for logged games that should be over, fill in the final score/winner.
+Odds tracker with three separate jobs. Run:  python tracker.py [radar|snapshot|results|all]
+(no argument = all three, in this order)
 
-Data goes to data/games.csv. Prices are logged, never traded - no Kalshi account needed.
+  RADAR     Looks 24 hours ahead for regular-season games, matches each one to its two
+            Kalshi markets, and saves the lineup to data/schedule.csv.
+  SNAPSHOT  Checks the schedule for games starting in 45-120 minutes and reads the
+            current prices for just those markets. Saves a row to data/games.csv.
+  RESULTS   Fills in final scores and winners for logged games.
+
+Prices are only read, never traded - no Kalshi account is needed.
 """
 import csv
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -26,15 +30,23 @@ LEAGUES = {
     "NCAAF": ("KXNCAAFGAME", "football/college-football"),
 }
 
-CSV_PATH = "data/games.csv"
-FIELDS = [
+GAMES_PATH = "data/games.csv"
+SCHEDULE_PATH = "data/schedule.csv"
+
+GAME_FIELDS = [
     "league", "espn_id", "kalshi_event", "start_utc", "snapshot_utc", "mins_before",
     "away", "home",
     "away_bid", "away_ask", "away_last", "away_oi",
     "home_bid", "home_ask", "home_last", "home_oi",
     "away_score", "home_score", "winner",
 ]
-WINDOW_MIN, WINDOW_MAX = 45, 120      # minutes before start
+SCHEDULE_FIELDS = [
+    "league", "espn_id", "kalshi_event", "start_utc", "away", "home",
+    "away_ticker", "home_ticker", "radar_utc",
+]
+
+RADAR_HOURS = 24                      # how far ahead the radar looks
+WINDOW_MIN, WINDOW_MAX = 45, 120      # snapshot window, minutes before start
 GIVE_UP_AFTER = timedelta(days=7)     # stop trying to fetch a result after this
 
 
@@ -83,7 +95,7 @@ def kalshi_matches(kname, team):
 # ---------- ESPN ----------
 def espn_games(path, now):
     games = {}
-    for offset in (-1, 0, 1):  # ESPN groups by US Eastern day, so look at 3 UTC days
+    for offset in (-1, 0, 1, 2):  # ESPN groups by US Eastern day, so look at several UTC days
         day = (now + timedelta(days=offset)).strftime("%Y%m%d")
         params = {"dates": day}
         if path.endswith("college-football"):
@@ -136,67 +148,106 @@ def match_event(events, home, away):
     return None
 
 
+def get_market(ticker):
+    data = get(f"{KALSHI}/markets/{ticker}")
+    if not data:
+        return None
+    return data.get("market", data)
+
+
 # ---------- storage ----------
-def load():
-    if not os.path.exists(CSV_PATH):
+def load(path):
+    if not os.path.exists(path):
         return []
-    with open(CSV_PATH, newline="") as f:
+    with open(path, newline="") as f:
         return list(csv.DictReader(f))
 
 
-def save(rows):
-    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
-    with open(CSV_PATH, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+def save(path, fields, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in FIELDS})
+            w.writerow({k: r.get(k, "") for k in fields})
 
 
-# ---------- the two jobs ----------
-def snapshot(rows, now):
-    seen = {(r["league"], r["espn_id"]) for r in rows}
+# ---------- job 1: RADAR ----------
+def radar(schedule, games, now):
+    logged = {(r["league"], r["espn_id"]) for r in games}
+    by_key = {(r["league"], r["espn_id"]): r for r in schedule}
     for league, (series, path) in LEAGUES.items():
-        cands = []
+        upcoming = []
         for g in espn_games(path, now):
-            mins = (g["start"] - now).total_seconds() / 60
-            if (
-                g["state"] == "pre"
-                and g["season_type"] in (2, None)  # 2 = regular season
-                and (league, g["id"]) not in seen
-                and WINDOW_MIN <= mins <= WINDOW_MAX
-            ):
-                cands.append((g, mins))
-              if:
-print(f"[{league}] {len(cands)} games in window")
-        if not cands:
+            hrs = (g["start"] - now).total_seconds() / 3600
+            if g["state"] == "pre" and g["season_type"] in (2, None) and 0 < hrs <= RADAR_HOURS:
+                upcoming.append(g)
+        new = []
+        for g in upcoming:
+            key = (league, g["id"])
+            if key in by_key:
+                by_key[key]["start_utc"] = g["start"].isoformat()  # keep start time current
+            elif key not in logged:
+                new.append(g)
+        print(f"[{league}] radar: {len(upcoming)} games in next {RADAR_HOURS}h, {len(new)} new")
+        if not new:
             continue
         events = kalshi_events(series)
-        for g, mins in cands:
+        for g in new:
             hit = match_event(events, g["home"], g["away"])
             if not hit:
                 print(f"[{league}] no Kalshi match: {g['away']['displayName']} @ {g['home']['displayName']}")
                 continue
             ticker, h, a = hit
-            h_ask, a_ask = num(h.get("yes_ask_dollars")), num(a.get("yes_ask_dollars"))
-            if not (h_ask and a_ask and 0 < h_ask < 1 and 0 < a_ask < 1):
-                print(f"[{league}] no usable ask on both sides: {ticker}")
-                continue
-            rows.append({
+            row = {
                 "league": league, "espn_id": g["id"], "kalshi_event": ticker,
-                "start_utc": g["start"].isoformat(), "snapshot_utc": now.isoformat(),
-                "mins_before": round(mins),
+                "start_utc": g["start"].isoformat(),
                 "away": g["away"]["displayName"], "home": g["home"]["displayName"],
-                "away_bid": a.get("yes_bid_dollars"), "away_ask": a.get("yes_ask_dollars"),
-                "away_last": a.get("last_price_dollars"), "away_oi": a.get("open_interest_fp"),
-                "home_bid": h.get("yes_bid_dollars"), "home_ask": h.get("yes_ask_dollars"),
-                "home_last": h.get("last_price_dollars"), "home_oi": h.get("open_interest_fp"),
-            })
-            print(f"[{league}] logged {g['away']['displayName']} @ {g['home']['displayName']} ({round(mins)} min before)")
+                "away_ticker": a["ticker"], "home_ticker": h["ticker"],
+                "radar_utc": now.isoformat(),
+            }
+            schedule.append(row)
+            by_key[(league, g["id"])] = row
+            print(f"[{league}] scheduled {row['away']} @ {row['home']}")
+    # drop old rows so the file stays small
+    return [r for r in schedule if parse_dt(r["start_utc"]) > now - timedelta(days=1)]
 
 
-def results(rows, now):
-    for r in rows:
+# ---------- job 2: SNAPSHOT ----------
+def snapshot(games, schedule, now):
+    seen = {(r["league"], r["espn_id"]) for r in games}
+    due = []
+    for s in schedule:
+        if (s["league"], s["espn_id"]) in seen:
+            continue
+        mins = (parse_dt(s["start_utc"]) - now).total_seconds() / 60
+        if WINDOW_MIN <= mins <= WINDOW_MAX:
+            due.append((s, mins))
+    print(f"snapshot: {len(schedule)} scheduled, {len(due)} due now")
+    for s, mins in due:
+        h, a = get_market(s["home_ticker"]), get_market(s["away_ticker"])
+        if not h or not a:
+            print(f"[{s['league']}] could not read markets: {s['kalshi_event']}")
+            continue
+        h_ask, a_ask = num(h.get("yes_ask_dollars")), num(a.get("yes_ask_dollars"))
+        if not (h_ask and a_ask and 0 < h_ask < 1 and 0 < a_ask < 1):
+            print(f"[{s['league']}] no usable ask on both sides: {s['kalshi_event']}")
+            continue
+        games.append({
+            "league": s["league"], "espn_id": s["espn_id"], "kalshi_event": s["kalshi_event"],
+            "start_utc": s["start_utc"], "snapshot_utc": now.isoformat(), "mins_before": round(mins),
+            "away": s["away"], "home": s["home"],
+            "away_bid": a.get("yes_bid_dollars"), "away_ask": a.get("yes_ask_dollars"),
+            "away_last": a.get("last_price_dollars"), "away_oi": a.get("open_interest_fp"),
+            "home_bid": h.get("yes_bid_dollars"), "home_ask": h.get("yes_ask_dollars"),
+            "home_last": h.get("last_price_dollars"), "home_oi": h.get("open_interest_fp"),
+        })
+        print(f"[{s['league']}] logged {s['away']} @ {s['home']} ({round(mins)} min before)")
+
+
+# ---------- job 3: RESULTS ----------
+def results(games, now):
+    for r in games:
         if r.get("winner"):
             continue
         start = parse_dt(r["start_utc"])
@@ -222,8 +273,17 @@ def results(rows, now):
 
 
 if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if mode not in ("radar", "snapshot", "results", "all"):
+        sys.exit("usage: python tracker.py [radar|snapshot|results|all]")
     now = datetime.now(timezone.utc)
-    rows = load()
-    snapshot(rows, now)
-    results(rows, now)
-    save(rows)
+    games = load(GAMES_PATH)
+    schedule = load(SCHEDULE_PATH)
+    if mode in ("radar", "all"):
+        schedule = radar(schedule, games, now)
+    if mode in ("snapshot", "all"):
+        snapshot(games, schedule, now)
+    if mode in ("results", "all"):
+        results(games, now)
+    save(GAMES_PATH, GAME_FIELDS, games)
+    save(SCHEDULE_PATH, SCHEDULE_FIELDS, schedule)
