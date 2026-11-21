@@ -167,6 +167,8 @@ def snapshot(rows, now):
                 and WINDOW_MIN <= mins <= WINDOW_MAX
             ):
                 cands.append((g, mins))
+              if:
+print(f"[{league}] {len(cands)} games in window")
         if not cands:
             continue
         events = kalshi_events(series)
